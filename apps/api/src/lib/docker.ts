@@ -13,50 +13,90 @@ export function formatLabelsOnDocker(data) {
 		return container
 	})
 }
-export async function checkContainer({ dockerId, container, remove = false }: { dockerId: string, container: string, remove?: boolean }): Promise<{ found: boolean, status?: { isExited: boolean, isRunning: boolean, isRestarting: boolean } }> {
+export async function checkContainer({ dockerId, container, remove = false }: { dockerId: string, container: string, remove?: boolean }): Promise<{ found: boolean, name?: string, status?: { isExited: boolean, isRunning: boolean, isRestarting: boolean } }> {
+	let target = container;
 	let containerFound = false;
 	try {
-		const { stdout } = await executeCommand({
+		await executeCommand({
 			dockerId,
 			command:
 				`docker inspect --format '{{json .State}}' ${container}`
 		});
-		containerFound = true
-		const parsedStdout = JSON.parse(stdout);
-		const status = parsedStdout.Status;
-		const isRunning = status === 'running';
-		const isRestarting = status === 'restarting'
-		const isExited = status === 'exited'
-		if (status === 'created') {
-			await executeCommand({
-				dockerId,
-				command:
-					`docker rm ${container}`
-			});
-		}
-		if (remove && status === 'exited') {
-			await executeCommand({
-				dockerId,
-				command:
-					`docker rm ${container}`
-			});
-		}
-
-		return {
-			found: containerFound,
-			status: {
-				isRunning,
-				isRestarting,
-				isExited
-			}
-		};
+		containerFound = true;
 	} catch (err) {
-		// Container not found
+		// A rolling (zero-downtime) deploy renames the container to <applicationId>-<buildId>.
+		// Fall back to any container Coolify launched for this application.
+		target = await resolveContainerName({ dockerId, container });
+		containerFound = target !== container;
+	}
+	if (containerFound) {
+		try {
+			const { stdout } = await executeCommand({
+				dockerId,
+				command:
+					`docker inspect --format '{{json .State}}' ${target}`
+			});
+			const parsedStdout = JSON.parse(stdout);
+			const status = parsedStdout.Status;
+			const isRunning = status === 'running';
+			const isRestarting = status === 'restarting';
+			const isExited = status === 'exited';
+			if (status === 'created') {
+				await executeCommand({
+					dockerId,
+					command:
+						`docker rm ${target}`
+				});
+			}
+			if (remove && status === 'exited') {
+				await executeCommand({
+					dockerId,
+					command:
+						`docker rm ${target}`
+				});
+			}
+			return {
+				found: true,
+				name: target,
+				status: {
+					isRunning,
+					isRestarting,
+					isExited
+				}
+			};
+		} catch (err) {
+			// Container not found
+		}
 	}
 	return {
 		found: false
 	};
+}
 
+export async function resolveContainerName({ dockerId, container }: { dockerId: string, container: string }): Promise<string> {
+	try {
+		await executeCommand({ dockerId, command: `docker inspect ${container}` });
+		return container;
+	} catch (err) {
+		//
+	}
+	try {
+		const { stdout } = await executeCommand({
+			dockerId,
+			command: `docker ps -a --filter "label=coolify.applicationId=${container}" --format "{{.Names}}|{{.State}}"`
+		});
+		const lines = (stdout || '')
+			.trim()
+			.split('\n')
+			.filter((line) => line.length > 0);
+		if (lines.length > 0) {
+			const running = lines.find((line) => line.endsWith('|running'));
+			return (running || lines[0]).split('|')[0];
+		}
+	} catch (err) {
+		//
+	}
+	return container;
 }
 
 export async function isContainerExited(dockerId: string, containerName: string): Promise<boolean> {

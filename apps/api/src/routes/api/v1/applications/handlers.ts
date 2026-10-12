@@ -32,7 +32,7 @@ import {
 	stopBuild,
 	uniqueName
 } from '../../../../lib/common';
-import { checkContainer, formatLabelsOnDocker, removeContainer } from '../../../../lib/docker';
+import { checkContainer, formatLabelsOnDocker, removeContainer, resolveContainerName } from '../../../../lib/docker';
 
 import type { FastifyRequest } from 'fastify';
 import type {
@@ -215,7 +215,7 @@ export async function getApplicationStatus(request: FastifyRequest<OnlyId>) {
 					isExited = status.status.isExited;
 					isRestarting = status.status.isRestarting;
 					payload.push({
-						name: id,
+						name: status.name || id,
 						status: {
 							isRunning,
 							isExited,
@@ -601,7 +601,7 @@ export async function restartApplication(
 			} else {
 				const { stdout: container } = await executeCommand({
 					dockerId,
-					command: `docker container ls --filter 'label=com.docker.compose.service=${id}' --format '{{json .}}'`
+					command: `docker container ls --filter 'label=coolify.applicationId=${id}' --format '{{json .}}'`
 				});
 				const containersArray = container.trim().split('\n');
 				for (const container of containersArray) {
@@ -679,8 +679,18 @@ export async function restartApplication(
 			};
 			await fs.writeFile(`${workdir}/docker-compose.yml`, yaml.dump(composeFile));
 			try {
-				await executeCommand({ dockerId, command: `docker stop -t 0 ${id}` });
-				await executeCommand({ dockerId, command: `docker rm ${id}` });
+				const { stdout: containers } = await executeCommand({
+					dockerId,
+					command: `docker ps -a --filter "label=coolify.applicationId=${id}" --format "{{.ID}}"`
+				});
+				const containerIds = (containers || '')
+					.trim()
+					.split('\n')
+					.filter((containerId) => containerId.length > 0);
+				for (const containerId of containerIds) {
+					await executeCommand({ dockerId, command: `docker stop -t 0 ${containerId}` });
+					await executeCommand({ dockerId, command: `docker rm --force ${containerId}` });
+				}
 			} catch (error) {
 				//
 			}
@@ -720,9 +730,9 @@ export async function stopApplication(request: FastifyRequest<OnlyId>, reply: Fa
 				}
 				return;
 			}
-			const { found } = await checkContainer({ dockerId, container: id });
-			if (found) {
-				await removeContainer({ id, dockerId: application.destinationDocker.id });
+			const status = await checkContainer({ dockerId, container: id });
+			if (status?.found) {
+				await removeContainer({ id: status.name || id, dockerId: application.destinationDocker.id });
 			}
 		}
 		return reply.code(201).send();
@@ -846,7 +856,13 @@ export async function getUsage(request) {
 
 		const application: any = await getApplicationFromDB(id, teamId);
 		if (application.destinationDockerId) {
-			[usage] = await Promise.all([getContainerUsage(application.destinationDocker.id, id)]);
+			const resolvedContainer = await resolveContainerName({
+				dockerId: application.destinationDocker.id,
+				container: id
+			});
+			[usage] = await Promise.all([
+				getContainerUsage(application.destinationDocker.id, resolvedContainer)
+			]);
 		}
 		return {
 			usage
@@ -868,7 +884,7 @@ export async function getDockerImages(request) {
 			});
 			const { stdout: runningImage } = await executeCommand({
 				dockerId: application.destinationDocker.id,
-				command: `docker ps -a --filter 'label=com.docker.compose.service=${id}' --format {{.Image}}`
+				command: `docker ps -a --filter 'label=coolify.applicationId=${id}' --format {{.Image}}`
 			});
 			const images = stdout
 				.trim()
@@ -912,8 +928,12 @@ export async function getUsageByContainer(request) {
 
 		const application: any = await getApplicationFromDB(id, teamId);
 		if (application.destinationDockerId) {
+			const resolvedContainer = await resolveContainerName({
+				dockerId: application.destinationDocker.id,
+				container: containerId
+			});
 			[usage] = await Promise.all([
-				getContainerUsage(application.destinationDocker.id, containerId)
+				getContainerUsage(application.destinationDocker.id, resolvedContainer)
 			]);
 		}
 		return {
@@ -1609,9 +1629,13 @@ export async function getApplicationLogs(request: FastifyRequest<GetApplicationL
 		if (destinationDockerId) {
 			try {
 				const { default: ansi } = await import('strip-ansi');
+				const resolvedContainerId = await resolveContainerName({
+					dockerId,
+					container: containerId
+				});
 				const { stdout, stderr } = await executeCommand({
 					dockerId,
-					command: `docker logs --since ${since} --tail 5000 --timestamps ${containerId}`
+					command: `docker logs --since ${since} --tail 5000 --timestamps ${resolvedContainerId}`
 				});
 				const stripLogsStdout = stdout
 					.toString()

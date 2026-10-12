@@ -4,6 +4,23 @@ import { getTemplates } from '../../../lib/services';
 import { OnlyId } from '../../../types';
 import { parseAndFindServiceTemplates } from '../../api/v1/services/handlers';
 import { hashPassword } from '../../api/v1/handlers';
+import fs from 'fs';
+
+// --- zero-downtime deploy support ---
+// Returns the container name the deploy job marked as active for this
+// application, or null. Written by the deploy job once a replacement
+// container passed its readiness probe.
+function getZdActiveContainer(applicationId: string): string | null {
+	try {
+		const data = JSON.parse(fs.readFileSync('/app/db/zd-active.json', 'utf8'));
+		if (data && typeof data[applicationId] === 'string') {
+			return data[applicationId];
+		}
+	} catch {
+		//
+	}
+	return null;
+}
 
 function generateServices(serviceId, containerId, port, isHttp2 = false, isHttps = false) {
 	if (isHttp2) {
@@ -185,6 +202,11 @@ async function generateRouters({
 			}
 		}
 	}
+	[http, https, httpWWW, httpsWWW].forEach((router) => {
+		if (!router.middlewares.includes('coolify-retry')) {
+			router.middlewares.push('coolify-retry');
+		}
+	});
 	if (isHttp2) {
 		const http2 = {
 			...http,
@@ -258,7 +280,13 @@ export async function proxyConfiguration(request: FastifyRequest<OnlyId>, remote
 						regex: '^https?://(?:www\\.)?(.+)',
 						replacement: 'http://www.${1}'
 					}
-				}
+				},
+				'coolify-retry': {
+					retry: {
+						attempts: 60,
+						initialInterval: '500ms'
+					}
+				},
 			}
 		}
 	};
@@ -490,9 +518,22 @@ export async function proxyConfiguration(request: FastifyRequest<OnlyId>, remote
 							httpBasicAuth
 						})
 					};
+					let targetContainer = id;
+					const zdActive = getZdActiveContainer(id);
+					const runningForApp = runningContainers[destinationDockerId] || [];
+					if (zdActive && runningForApp.includes(zdActive)) {
+						targetContainer = zdActive;
+					} else {
+						const candidates = runningForApp.filter((c) => c.startsWith(id));
+						if (candidates.includes(id)) {
+							targetContainer = id;
+						} else if (candidates.length > 0) {
+							targetContainer = candidates[candidates.length - 1];
+						}
+					}
 					traefik.http.services = {
 						...traefik.http.services,
-						...generateServices(serviceId, id, port, isHttp2, isHttps)
+						...generateServices(serviceId, targetContainer, port, isHttp2, isHttps)
 					};
 					if (httpBasicAuth) {
 						traefik.http.middlewares[`${serviceId}-${pathPrefix}-basic-auth`] = {

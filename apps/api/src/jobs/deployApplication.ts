@@ -26,6 +26,97 @@ import {
 import * as importers from '../lib/importers';
 import * as buildpacks from '../lib/buildPacks';
 
+// --- zero-downtime deploy support ---
+// The active container per application is tracked in a small JSON file on the
+// persistent db volume, so the Traefik config generator can point the service
+// at the replacement container as soon as it is ready.
+const ZD_ACTIVE_FILE = '/app/db/zd-active.json';
+function zdSleep(ms: number) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function setZdActiveContainer(applicationId: string, containerName: string) {
+	let map: Record<string, string> = {};
+	try {
+		map = JSON.parse(await fs.readFile(ZD_ACTIVE_FILE, 'utf8'));
+	} catch {
+		map = {};
+	}
+	if (!map || typeof map !== 'object') map = {};
+	map[applicationId] = containerName;
+	await fs.writeFile(`${ZD_ACTIVE_FILE}.tmp`, JSON.stringify(map));
+	await fs.rename(`${ZD_ACTIVE_FILE}.tmp`, ZD_ACTIVE_FILE);
+}
+async function waitForAppReady({
+	dockerId,
+	network,
+	containerName,
+	port,
+	httpTimeoutMs = 120000,
+	runningGraceMs = 20000
+}: {
+	dockerId: string;
+	network: string;
+	containerName: string;
+	port: number | string;
+	httpTimeoutMs?: number;
+	runningGraceMs?: number;
+}) {
+	try {
+		await executeCommand({
+			dockerId,
+			command: `docker network connect ${network} coolify`
+		});
+	} catch {
+		//
+	}
+	const deadline = Date.now() + httpTimeoutMs;
+	let runningSince: number | null = null;
+	let seenRestarts: string | null = null;
+	while (Date.now() < deadline) {
+		try {
+			const { stdout } = await executeCommand({
+				dockerId,
+				command: `curl -s -o /dev/null -w %{http_code} --max-time 3 http://${containerName}:${port}/`
+			});
+			const code = (stdout || '').trim();
+			if (/^[1-5][0-9][0-9]$/.test(code)) {
+				return true;
+			}
+		} catch {
+			//
+		}
+		try {
+			const { stdout } = await executeCommand({
+				dockerId,
+				command: `docker inspect -f "{{.State.Running}} {{.RestartCount}}" ${containerName}`
+			});
+			const parts = (stdout || '').trim().split(' ');
+			const running = parts[0];
+			const restarts = parts[1];
+			if (running === 'true') {
+				if (seenRestarts === null || restarts !== seenRestarts) {
+					seenRestarts = restarts;
+					runningSince = Date.now();
+				} else if (runningSince === null) {
+					runningSince = Date.now();
+				}
+			} else {
+				runningSince = null;
+				seenRestarts = null;
+			}
+		} catch {
+			runningSince = null;
+			seenRestarts = null;
+		}
+		if (runningSince !== null && Date.now() - runningSince >= runningGraceMs) {
+			return true;
+		}
+		await zdSleep(1000);
+	}
+	return false;
+}
+
+
 (async () => {
 	if (parentPort) {
 		parentPort.on('message', async (message) => {
@@ -681,37 +772,27 @@ import * as buildpacks from '../lib/buildPacks';
 											throw new Error(error);
 										}
 									} else {
+										const isPreview = !!pullmergeRequestId;
+										const newContainerName = isPreview ? imageId : `${imageId}-${buildId}`;
+										let oldContainerNames: string[] = [];
 										try {
+											const oldFilter = isPreview
+												? `label=com.docker.compose.service=${imageId}`
+												: `label=coolify.applicationId=${applicationId}`;
 											const { stdout: containers } = await executeCommand({
 												dockerId: destinationDockerId,
-												command: `docker ps -a --filter 'label=com.docker.compose.service=${
-													pullmergeRequestId ? imageId : applicationId
-												}' --format {{.ID}}`
+												command: `docker ps -a --filter '${oldFilter}' --format {{.Names}}`
 											});
-											if (containers) {
-												const containerArray = containers.split('\n');
-												if (containerArray.length > 0) {
-													for (const container of containerArray) {
-														await executeCommand({
-															dockerId: destinationDockerId,
-															command: `docker stop -t 0 ${container}`
-														});
-														await executeCommand({
-															dockerId: destinationDockerId,
-															command: `docker rm --force ${container}`
-														});
-													}
-												}
-											}
+											oldContainerNames = (containers || '')
+												.split('\n')
+												.map((c) => c.trim())
+												.filter(Boolean);
 										} catch (error) {
 											//
 										}
 										let envs = [];
 										if (secrets.length > 0) {
-											envs = [
-												...envs,
-												...generateSecrets(secrets, pullmergeRequestId, false, port)
-											];
+											envs = [...envs, ...generateSecrets(secrets, pullmergeRequestId, false, port)];
 										}
 										if (dockerRegistry) {
 											const { url, username, password } = dockerRegistry;
@@ -739,9 +820,9 @@ import * as buildpacks from '../lib/buildPacks';
 											const composeFile = {
 												version: '3.8',
 												services: {
-													[imageId]: {
+													[newContainerName]: {
 														image: imageFound,
-														container_name: imageId,
+														container_name: newContainerName,
 														volumes,
 														environment: envs,
 														labels,
@@ -758,12 +839,80 @@ import * as buildpacks from '../lib/buildPacks';
 												},
 												volumes: Object.assign({}, ...composeVolumes)
 											};
-											await fs.writeFile(`${workdir}/docker-compose.yml`, yaml.dump(composeFile));
-											await executeCommand({
-												debug,
-												dockerId: destinationDocker.id,
-												command: `docker compose --project-directory ${workdir} -f ${workdir}/docker-compose.yml up -d`
-											});
+											const zdComposeFile = `${workdir}/docker-compose.zd.yml`;
+											await fs.writeFile(zdComposeFile, yaml.dump(composeFile));
+											const canOverlap = !isPreview && !exposePort;
+											if (canOverlap) {
+												await executeCommand({
+													debug,
+													dockerId: destinationDocker.id,
+													command: `docker compose --project-directory ${workdir} -p ${buildId} -f ${zdComposeFile} up -d`
+												});
+												await saveBuildLog({
+													line: `Rolling update: started ${newContainerName}, waiting for readiness...`,
+													buildId,
+													applicationId
+												});
+												const ready = await waitForAppReady({
+													dockerId: destinationDockerId,
+													network: destinationDocker.network,
+													containerName: newContainerName,
+													port
+												});
+												if (!ready) {
+													throw new Error(
+														`Replacement container ${newContainerName} did not become ready; keeping the running deployment.`
+													);
+												}
+												await setZdActiveContainer(applicationId, newContainerName);
+												await saveBuildLog({
+													line: `Rolling update: ${newContainerName} is ready, switching traffic...`,
+													buildId,
+													applicationId
+												});
+												await zdSleep(7000);
+												for (const oldContainer of oldContainerNames) {
+													if (oldContainer === newContainerName) continue;
+													try {
+														await executeCommand({
+															dockerId: destinationDockerId,
+															command: `docker stop -t 15 ${oldContainer}`
+														});
+														await executeCommand({
+															dockerId: destinationDockerId,
+															command: `docker rm ${oldContainer}`
+														});
+														await saveBuildLog({
+															line: `Rolling update: removed previous container ${oldContainer}`,
+															buildId,
+															applicationId
+														});
+													} catch (error) {
+														//
+													}
+												}
+											} else {
+												for (const oldContainer of oldContainerNames) {
+													if (oldContainer === newContainerName) continue;
+													try {
+														await executeCommand({
+															dockerId: destinationDockerId,
+															command: `docker stop -t 0 ${oldContainer}`
+														});
+														await executeCommand({
+															dockerId: destinationDockerId,
+															command: `docker rm --force ${oldContainer}`
+														});
+													} catch (error) {
+														//
+													}
+												}
+												await executeCommand({
+													debug,
+													dockerId: destinationDocker.id,
+													command: `docker compose --project-directory ${workdir} -p ${buildId} -f ${zdComposeFile} up -d`
+												});
+											}
 											await saveBuildLog({ line: 'Deployed 🎉', buildId, applicationId });
 										} catch (error) {
 											await saveBuildLog({ line: error, buildId, applicationId });
@@ -778,7 +927,6 @@ import * as buildpacks from '../lib/buildPacks';
 											}
 											throw new Error(error);
 										}
-
 										if (!pullmergeRequestId)
 											await prisma.application.update({
 												where: { id: applicationId },
