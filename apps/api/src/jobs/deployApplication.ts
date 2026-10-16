@@ -428,6 +428,7 @@ async function waitForAppReady({
 							let tag = null;
 							let customTag = null;
 							let imageName = null;
+							let pullAuthoritative = false;
 
 							let imageFoundLocally = false;
 							let imageFoundRemotely = false;
@@ -556,8 +557,17 @@ async function waitForAppReady({
 										tag = `${commit.slice(0, 7)}-${pullmergeRequestId}`;
 									}
 									if (application.dockerRegistryImageName) {
-										imageName = application.dockerRegistryImageName.split(':')[0];
-										customTag = application.dockerRegistryImageName.split(':')[1] || tag;
+										const ref = application.dockerRegistryImageName;
+										const lastColon = ref.lastIndexOf(':');
+										const lastSlash = ref.lastIndexOf('/');
+										if (lastColon > lastSlash) {
+											imageName = ref.slice(0, lastColon);
+											customTag = ref.slice(lastColon + 1) || tag;
+										} else {
+											imageName = ref;
+											customTag = tag;
+										}
+										pullAuthoritative = true;
 									} else {
 										customTag = tag;
 										imageName = applicationId;
@@ -607,16 +617,31 @@ async function waitForAppReady({
 										});
 									}
 
+									if (pullAuthoritative && forceRebuild) {
+										try {
+											await executeCommand({
+												dockerId: destinationDocker.id,
+												command: `docker rmi ${imageName}:${customTag}`
+											});
+										} catch (error) {
+											//
+										}
+									}
 									try {
 										await executeCommand({
 											dockerId: destinationDocker.id,
-											command: `docker ${
-												location ? `--config ${location}` : ''
-											} pull ${imageName}:${customTag}`
+											command: `docker ${location ? `--config ${location}` : ''} pull ${imageName}:${customTag}`
 										});
 										imageFoundRemotely = true;
 									} catch (error) {
-										//
+										if (pullAuthoritative) {
+											await saveBuildLog({
+												line: `Registry image ${imageName}:${customTag} could not be pulled. Refusing to build on the host; build and push it from CI or fix the registry credentials.`,
+												buildId,
+												applicationId
+											});
+											throw new Error(`Could not pull ${imageName}:${customTag} from the registry.`);
+										}
 									}
 									let imageFound = `${applicationId}:${tag}`;
 									if (imageFoundRemotely) {
@@ -647,8 +672,12 @@ async function waitForAppReady({
 										baseDirectory,
 										publishDirectory
 									});
-									if (forceRebuild) deployNeeded = true;
-									if ((!imageFoundLocally && !imageFoundRemotely) || deployNeeded) {
+									if (pullAuthoritative) {
+										deployNeeded = false;
+									} else if (forceRebuild) {
+										deployNeeded = true;
+									}
+									if (!pullAuthoritative && ((!imageFoundLocally && !imageFoundRemotely) || deployNeeded)) {
 										if (buildpacks[buildPack])
 											await buildpacks[buildPack]({
 												dockerId: destinationDocker.id,
@@ -958,7 +987,7 @@ async function waitForAppReady({
 								return;
 							}
 							try {
-								if (application.dockerRegistryImageName && (!imageFoundRemotely || forceRebuild)) {
+								if (application.dockerRegistryImageName && !pullAuthoritative && (!imageFoundRemotely || forceRebuild)) {
 									await saveBuildLog({
 										line: `Pushing ${imageName}:${customTag} to Docker Registry... It could take a while...`,
 										buildId,

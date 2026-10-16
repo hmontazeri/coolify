@@ -50,6 +50,31 @@ one answers HTTP.
    - Status, stop, restart, logs, usage and image lookups resolve the current
      container name instead of assuming `<applicationId>`.
 
+5. `apps/api/src/jobs/deployApplication.ts` (registry pull-only mode)
+   - When an application has a **Docker Registry Image Name** set, the deploy is
+     pull-authoritative: Coolify pulls `image:tag` and never builds on the host,
+     even if the app config changed or a "force rebuild" is requested (that only
+     re-pulls). The tag is parsed from the last colon after the last slash, so a
+     registry host with a port works.
+   - A failed pull fails the deploy loudly instead of silently building on the
+     host, so a broken credential or a missing image is visible and the previous
+     container keeps serving (the rolling path means no downtime).
+   - Coolify never pushes in this mode, so it cannot overwrite an image built by
+     CI.
+
+## Building images elsewhere (CI) and pulling them
+
+Set the app's Docker Registry + Docker Registry Image Name (for example
+`ghcr.io/<user>/<app>:staging`) and build/push that tag from GitHub Actions:
+
+```yaml
+docker buildx build --platform linux/amd64 -t ghcr.io/<user>/<app>:staging --push .
+```
+
+Coolify then only pulls and rolls out. The server is `linux/amd64`, so build for
+that platform. See the `coolify-deployments` skill for the full recipe and the
+host's registry credential.
+
 ## Build
 
 The Docker image is built from source with esbuild:
